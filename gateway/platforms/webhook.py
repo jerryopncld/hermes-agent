@@ -37,6 +37,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -241,6 +242,17 @@ class WebhookAdapter(BasePlatformAdapter):
             script_timeout_seconds=self._script_timeout_seconds
         )
 
+        # Synchronous completion: per-delivery Futures for routes with
+        # wait_for_completion=true.  The HTTP handler awaits the Future
+        # instead of returning 202 immediately, so the caller (e.g. n8n)
+        # blocks until the agent finishes.  Resolved in on_processing_complete.
+        self._pending_completions = {}
+        # Last response content per chat_id, captured in send() so the
+        # synchronous HTTP response can include the agent's output.
+        self._completion_responses = {}
+        # Per-route concurrency semaphores for wait_for_completion routes.
+        self._route_semaphores = {}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -375,7 +387,16 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
 
-        if deliver_type == "log":
+        # Capture the response content for synchronous completion mode.
+        if content and content.strip():
+            self._completion_responses[chat_id] = content
+
+        if deliver_type == "log" or deliver_type == "origin":
+            # "log" — response is logged only (fire-and-forget).
+            # "origin" — response goes back to the webhook caller via the HTTP
+            # response body (wait_for_completion mode) or the on_processing_complete
+            # callback. No external platform delivery needed — the webhook adapter
+            # itself is the delivery channel.
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
 
@@ -914,6 +935,48 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
+        # Check if this route wants synchronous completion.
+        wait_for_completion = bool(route_config.get("wait_for_completion", False))
+
+        if wait_for_completion:
+            max_concurrent = route_config.get("max_concurrent")
+            if max_concurrent and isinstance(max_concurrent, int) and max_concurrent > 0:
+                if route_name not in self._route_semaphores:
+                    self._route_semaphores[route_name] = asyncio.Semaphore(max_concurrent)
+                    logger.info("[webhook] Route '%s' max_concurrent=%d", route_name, max_concurrent)
+                semaphore = self._route_semaphores[route_name]
+            else:
+                semaphore = None
+
+            completion_future = asyncio.get_event_loop().create_future()
+            self._pending_completions[session_chat_id] = completion_future
+
+            async def _gated_wait():
+                if semaphore is not None:
+                    await semaphore.acquire()
+                try:
+                    task = asyncio.create_task(self.handle_message(event))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                    return await completion_future
+                finally:
+                    if semaphore is not None:
+                        semaphore.release()
+
+            try:
+                gateway_timeout = int(os.environ.get("HERMES_AGENT_TIMEOUT", "1800"))
+                outcome = await asyncio.wait_for(_gated_wait(), timeout=gateway_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("[webhook] wait_for_completion timed out for %s (delivery=%s)", route_name, delivery_id)
+                self._pending_completions.pop(session_chat_id, None)
+                self._completion_responses.pop(session_chat_id, None)
+                return web.json_response({"status": "timeout", "route": route_name, "event": event_type, "delivery_id": delivery_id}, status=504)
+
+            response_text = self._completion_responses.pop(session_chat_id, "")
+            self._pending_completions.pop(session_chat_id, None)
+            status_code = 200 if outcome == "success" else 500
+            return web.json_response({"status": outcome, "route": route_name, "event": event_type, "delivery_id": delivery_id, "response": response_text}, status=status_code)
+
         # Non-blocking — return 202 Accepted immediately.  The per-delivery
         # session is closed by the ``on_processing_complete`` override below
         # once the agent run actually finishes (``handle_message`` itself is
@@ -955,7 +1018,15 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        chat_id = event.source.chat_id
+
+        # Resolve the synchronous completion Future if one is pending.
+        future = self._pending_completions.pop(chat_id, None)
+        if future is not None and not future.done():
+            outcome_str = getattr(outcome, "value", str(outcome))
+            future.set_result(outcome_str)
+
+        await self._end_webhook_session(event, chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
