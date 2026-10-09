@@ -704,16 +704,31 @@ class VoiceReceiver:
     """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
     RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
 
-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
-    MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
+    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance (default; overridden by config)
+    MIN_SPEECH_DURATION = 0.3  # minimum seconds to process (skip noise) (default; overridden by config)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
     REKEY_FAILURE_STREAK = 25  # consecutive NaCl failures → re-resolve creds
+    # RMS energy threshold for voice activity detection (VAD).
+    # Below this, a frame is considered silence/comfort noise.
+    # 16-bit PCM: full-scale = 32767. 300 is ~-40dBFS — well below speech
+    # but above Opus comfort-noise / digital silence.
+    VAD_ENERGY_THRESHOLD = 300
+    # How many recent frames to check for energy (each frame = 20ms).
+    VAD_FRAME_COUNT = 3
 
-    def __init__(self, voice_client, allowed_user_ids: set | None = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None, *,
+                 silence_threshold: float = SILENCE_THRESHOLD,
+                 min_speech_duration: float = MIN_SPEECH_DURATION,
+                 vad_energy_threshold: int = VAD_ENERGY_THRESHOLD,
+                 vad_frame_count: int = VAD_FRAME_COUNT):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
+        self.silence_threshold = silence_threshold
+        self.min_speech_duration = min_speech_duration
+        self.vad_energy_threshold = vad_energy_threshold
+        self.vad_frame_count = vad_frame_count
 
         # Decryption state, kept as ONE tuple (secret_key, dave_session,
         # dave_protocol_version, dave_downgraded) so the receive thread
@@ -733,6 +748,11 @@ class VoiceReceiver:
         self._lock = threading.Lock()
         self._buffers: dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: dict[int, float] = {}
+        # VAD: time of last frame with energy above threshold (speech).
+        # Updated only on loud frames, NOT on comfort-noise/silence frames.
+        self._last_speech_time: dict[int, float] = {}
+        # Whether we're currently collecting an utterance for this SSRC.
+        self._speaking: dict[int, bool] = defaultdict(bool)
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: dict[int, object] = {}
         # Pause flag: don't capture while bot is playing TTS
@@ -855,6 +875,8 @@ class VoiceReceiver:
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._last_speech_time.clear()
+            self._speaking.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
         logger.info(
@@ -1093,9 +1115,37 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             self._decode_ok += 1
+
+            # VAD: compute RMS energy to classify speech vs silence.
+            # 16-bit PCM samples; RMS tells us if this frame has voice energy.
+            samples = struct.unpack('<%dh' % (len(pcm) // 2), pcm)
+            if samples:
+                rms = int(math.sqrt(sum(s * s for s in samples) / len(samples)))
+            else:
+                rms = 0
+            is_speech = rms >= self.vad_energy_threshold
+
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
+                if is_speech:
+                    # Only buffer frames with voice energy — skip silence/
+                    # comfort-noise packets that inflate the recording.
+                    self._buffers[ssrc].extend(pcm)
+                    self._last_speech_time[ssrc] = time.monotonic()
+                    if not self._speaking[ssrc]:
+                        self._speaking[ssrc] = True
+                        logger.info("VAD: speech started for ssrc=%d (rms=%d)", ssrc, rms)
+                else:
+                    # Silence frame — buffer a small amount for natural
+                    # transitions, but don't let it dominate.  Only extend
+                    # if we're in an active utterance (avoids pre-speech
+                    # silence padding).
+                    if self._speaking[ssrc]:
+                        self._buffers[ssrc].extend(pcm)
+
+            if self._packet_debug_count <= 10:
+                buf_len = len(self._buffers.get(ssrc, b''))
+                logger.debug("Opus decode OK: ssrc=%d, pcm=%d bytes, rms=%d, speech=%s, buffer=%d bytes", ssrc, len(pcm), rms, is_speech, buf_len)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -1134,24 +1184,37 @@ class VoiceReceiver:
             ssrc_user_map = dict(self._ssrc_to_user)
             ssrc_list = list(self._buffers.keys())
             for ssrc in ssrc_list:
-                last_time = self._last_packet_time.get(ssrc, now)
-                silence_duration = now - last_time
+                # Use _last_speech_time (VAD-based) instead of
+                # _last_packet_time — comfort-noise/silence packets keep
+                # updating _last_packet_time, which prevents the silence
+                # threshold from ever triggering and inflates recordings
+                # with tens of seconds of silence.
+                last_speech = self._last_speech_time.get(ssrc, 0)
+                silence_duration = now - last_speech
                 buf = self._buffers[ssrc]
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                if silence_duration >= self.silence_threshold and buf_duration >= self.min_speech_duration:
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
+                        logger.info(
+                            "Utterance completed: user=%d, %.2fs audio (buffer=%d bytes)",
+                            user_id, buf_duration, len(buf),
+                        )
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                    self._last_speech_time.pop(ssrc, None)
+                    self._speaking[ssrc] = False
+                elif silence_duration >= self.silence_threshold * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._last_speech_time.pop(ssrc, None)
+                    self._speaking[ssrc] = False
         return completed
 
     def flush_pending(self) -> list:
@@ -1162,7 +1225,7 @@ class VoiceReceiver:
             for ssrc, buf in list(self._buffers.items()):
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
-                if buf_duration >= self.MIN_SPEECH_DURATION:
+                if buf_duration >= self.min_speech_duration:
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         user_id = self._infer_user_for_ssrc(ssrc)
@@ -1170,6 +1233,8 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+                self._last_speech_time.pop(ssrc, None)
+                self._speaking[ssrc] = False
         return completed
 
     def discard_pending(self) -> None:
